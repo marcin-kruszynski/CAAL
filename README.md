@@ -15,6 +15,7 @@ Built on [LiveKit Agents](https://docs.livekit.io/agents/) with fully local STT/
 - **n8n Integrations**: Home Assistant, APIs, databases - anything n8n can connect to
 - **Web Search**: DuckDuckGo integration for real-time information
 - **Webhook API**: External triggers for announcements and tool reload
+- **Mobile App**: Flutter client for Android and iOS (see `mobile/`)
 
 ## Quick Start (Docker)
 
@@ -277,6 +278,23 @@ curl -X POST http://localhost:8889/reload-tools \
   -d '{"tool_name": "calendar_create_event"}'
 ```
 
+## Mobile App
+
+A Flutter mobile client is available in the `mobile/` directory for Android and iOS.
+
+```bash
+cd mobile
+cp .env.example .env
+nano .env  # Set CAAL_SERVER_URL to your server
+
+flutter pub get
+flutter run
+```
+
+**Note:** Wake word requires training separate mobile models from Picovoice Console (the web WASM models don't work on mobile).
+
+See `mobile/README.md` for full documentation.
+
 ## Local Development
 
 ```bash
@@ -312,6 +330,10 @@ caal/
 ├── frontend/                   # Next.js web interface
 │   ├── public/                 # Wake word models go here
 │   └── components/             # UI components
+├── mobile/                     # Flutter mobile app
+│   ├── lib/                    # Dart source code
+│   ├── android/                # Android config
+│   └── ios/                    # iOS config
 ├── n8n-workflows/              # Example n8n workflows
 │   ├── setup.py                # One-command deployment
 │   ├── config.env.example      # Configuration template
