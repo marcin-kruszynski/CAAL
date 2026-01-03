@@ -15,7 +15,7 @@ keywords = [
     "text-to-speech",
     "mcp",
     "n8n",
-    "ollama",
+    "llamacpp",
     "speaches",
     "local",
     "self-hosted"
@@ -36,7 +36,7 @@ dependencies = [
     "livekit-agents[silero,turn-detector,mcp,groq]~=1.3",
 
     # LLM
-    "ollama>=0.3.0",
+    "openai>=1.0.0",  # For llama.cpp server (OpenAI-compatible API)
 
     # Core utilities
     "python-dotenv>=1.0.0",

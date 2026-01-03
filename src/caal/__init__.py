@@ -5,7 +5,7 @@ CAAL - Voice Assistant
 A modular voice assistant with n8n workflow integrations and local LLM support.
 
 Core Components:
-    OllamaLLM: Native Ollama LLM with think parameter support for Qwen3
+    LlamaCppLLM: llama.cpp server LLM with OpenAI-compatible API
 
 STT/TTS:
     - Speaches container for Faster-Whisper STT
@@ -15,10 +15,10 @@ Integrations:
     n8n: Workflow discovery and execution via n8n MCP
 
 Example:
-    >>> from caal import OllamaLLM
+    >>> from caal import LlamaCppLLM
     >>> from caal.integrations import load_mcp_config
     >>>
-    >>> llm = OllamaLLM(model="qwen3:8b", think=False)
+    >>> llm = LlamaCppLLM(model="gpt-oss-20b-mxfp4")
     >>> mcp_configs = load_mcp_config()
 
 Repository: https://github.com/CoreWorxLab/caal
@@ -28,9 +28,9 @@ License: MIT
 __version__ = "0.1.0"
 __author__ = "CoreWorxLab"
 
-from .llm import OllamaLLM
+from .llm import LlamaCppLLM
 
 __all__ = [
-    "OllamaLLM",
+    "LlamaCppLLM",
     "__version__",
 ]

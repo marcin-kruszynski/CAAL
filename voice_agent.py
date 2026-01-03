@@ -17,8 +17,8 @@ Environment Variables:
     KOKORO_URL          - Kokoro TTS service URL (default: "http://kokoro:8880")
     WHISPER_MODEL       - Whisper model for STT (default: "Systran/faster-whisper-small")
     TTS_VOICE           - Kokoro voice name (default: "af_heart")
-    OLLAMA_MODEL        - Ollama model name (default: "qwen3:8b")
-    OLLAMA_THINK        - Enable thinking mode (default: "false")
+    OLLAMA_MODEL        - LLM model name (default: "gpt-oss-20b-mxfp4", kept for backward compatibility)
+    LLAMACPP_HOST       - llama.cpp server URL (default: "http://llama.home/v1")
     TIMEZONE            - Timezone for date/time (default: "Pacific Time")
 """
 
@@ -45,14 +45,14 @@ from livekit import agents
 from livekit.agents import AgentSession, Agent, RoomInputOptions, mcp
 from livekit.plugins import silero, openai
 
-from caal import OllamaLLM
+from caal import LlamaCppLLM
 from caal.integrations import (
     load_mcp_config,
     initialize_mcp_servers,
     WebSearchTools,
     discover_n8n_workflows,
 )
-from caal.llm import ollama_llm_node, ToolDataCache
+from caal.llm import llamacpp_llm_node, ToolDataCache
 from caal import session_registry
 from caal.stt import WakeWordGatedSTT
 
@@ -81,7 +81,7 @@ SPEACHES_URL = os.getenv("SPEACHES_URL", "http://speaches:8000")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "Systran/faster-whisper-small")
 KOKORO_URL = os.getenv("KOKORO_URL", "http://kokoro:8880")
 TTS_MODEL = os.getenv("TTS_MODEL", "kokoro")  # "kokoro" for Kokoro-FastAPI, "prince-canuma/Kokoro-82M" for mlx-audio
-OLLAMA_THINK = os.getenv("OLLAMA_THINK", "false").lower() == "true"
+LLAMACPP_HOST = os.getenv("LLAMACPP_HOST", os.getenv("OLLAMA_HOST", "http://llama.home/v1"))
 TIMEZONE_ID = os.getenv("TIMEZONE", "America/Los_Angeles")
 TIMEZONE_DISPLAY = os.getenv("TIMEZONE_DISPLAY", "Pacific Time")
 
@@ -99,10 +99,10 @@ def get_runtime_settings() -> dict:
 
     return {
         "tts_voice": settings.get("tts_voice") or os.getenv("TTS_VOICE", "am_puck"),
-        "model": settings.get("model") or os.getenv("OLLAMA_MODEL", "ministral-3:8b"),
-        "temperature": settings.get("temperature", float(os.getenv("OLLAMA_TEMPERATURE", "0.7"))),
-        "num_ctx": settings.get("num_ctx", int(os.getenv("OLLAMA_NUM_CTX", "8192"))),
-        "max_turns": settings.get("max_turns", int(os.getenv("OLLAMA_MAX_TURNS", "20"))),
+        "model": settings.get("model") or os.getenv("OLLAMA_MODEL", os.getenv("LLAMACPP_MODEL", "gpt-oss-20b-mxfp4")),
+        "temperature": settings.get("temperature", float(os.getenv("OLLAMA_TEMPERATURE", os.getenv("LLAMACPP_TEMPERATURE", "0.7")))),
+        "num_ctx": settings.get("num_ctx", int(os.getenv("OLLAMA_NUM_CTX", os.getenv("LLAMACPP_NUM_CTX", "8192")))),
+        "max_turns": settings.get("max_turns", int(os.getenv("OLLAMA_MAX_TURNS", os.getenv("LLAMACPP_MAX_TURNS", "20")))),
         "tool_cache_size": settings.get("tool_cache_size", int(os.getenv("TOOL_CACHE_SIZE", "3"))),
     }
 
@@ -128,7 +128,7 @@ class VoiceAssistant(WebSearchTools, Agent):
 
     def __init__(
         self,
-        ollama_llm: OllamaLLM,
+        llamacpp_llm: LlamaCppLLM,
         mcp_servers: dict[str, mcp.MCPServerHTTP] | None = None,
         n8n_workflow_tools: list[dict] | None = None,
         n8n_workflow_name_map: dict[str, str] | None = None,
@@ -139,7 +139,7 @@ class VoiceAssistant(WebSearchTools, Agent):
     ) -> None:
         super().__init__(
             instructions=load_prompt(),
-            llm=ollama_llm,  # Satisfies LLM interface requirement
+            llm=llamacpp_llm,  # Satisfies LLM interface requirement
         )
 
         # All MCP servers (for multi-MCP support)
@@ -159,13 +159,12 @@ class VoiceAssistant(WebSearchTools, Agent):
         self._max_turns = max_turns
 
     async def llm_node(self, chat_ctx, tools, model_settings):
-        """Custom LLM node using Ollama with think parameter for low latency."""
-        # Access config from OllamaLLM instance via self.llm
-        async for chunk in ollama_llm_node(
+        """Custom LLM node using llama.cpp server via OpenAI-compatible API."""
+        # Access config from LlamaCppLLM instance via self.llm
+        async for chunk in llamacpp_llm_node(
             self,
             chat_ctx,
             model=self.llm.model,
-            think=self.llm.think,
             temperature=self.llm.temperature,
             num_ctx=self.llm.num_ctx,
             tool_data_cache=self._tool_data_cache,
@@ -221,12 +220,12 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # Get runtime settings (from settings.json with .env fallback)
     runtime = get_runtime_settings()
 
-    # Create OllamaLLM instance (config lives here, accessed via self.llm in agent)
-    ollama_llm = OllamaLLM(
+    # Create LlamaCppLLM instance (config lives here, accessed via self.llm in agent)
+    llamacpp_llm = LlamaCppLLM(
         model=runtime["model"],
-        think=OLLAMA_THINK,
         temperature=runtime["temperature"],
         num_ctx=runtime["num_ctx"],
+        base_url=LLAMACPP_HOST,
     )
 
     # Log configuration
@@ -236,7 +235,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     logger.info(f"  STT: {SPEACHES_URL} ({WHISPER_MODEL})")
     logger.info(f"  TTS: {KOKORO_URL} ({runtime['tts_voice']})")
     logger.info(
-        f"  LLM: Ollama ({runtime['model']}, think={OLLAMA_THINK}, num_ctx={runtime['num_ctx']})"
+        f"  LLM: llama.cpp ({runtime['model']}, num_ctx={runtime['num_ctx']}, base_url={LLAMACPP_HOST})"
     )
     logger.info(f"  MCP: {list(mcp_servers.keys()) or 'None'}")
     logger.info("=" * 60)
@@ -326,7 +325,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     logger.info(f"  STT capabilities: streaming={stt_instance.capabilities.streaming}")
     session = AgentSession(
         stt=stt_instance,
-        llm=ollama_llm,
+        llm=llamacpp_llm,
         tts=openai.TTS(
             base_url=f"{KOKORO_URL}/v1",
             api_key="not-needed",  # Kokoro doesn't require auth
@@ -390,9 +389,9 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     # ==========================================================================
 
-    # Create agent with OllamaLLM and all MCP servers
+    # Create agent with LlamaCppLLM and all MCP servers
     assistant = VoiceAssistant(
-        ollama_llm=ollama_llm,
+        llamacpp_llm=llamacpp_llm,
         mcp_servers=mcp_servers,
         n8n_workflow_tools=n8n_workflow_tools,
         n8n_workflow_name_map=n8n_workflow_name_map,
@@ -451,9 +450,8 @@ def preload_models():
     """
     speaches_url = os.getenv("SPEACHES_URL", "http://speaches:8000")
     whisper_model = os.getenv("WHISPER_MODEL", "Systran/faster-whisper-medium")
-    ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-    ollama_model = os.getenv("OLLAMA_MODEL", "qwen3:8b")
-    ollama_num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+    llamacpp_host = os.getenv("LLAMACPP_HOST", os.getenv("OLLAMA_HOST", "http://llama.home/v1"))
+    llamacpp_model = os.getenv("OLLAMA_MODEL", os.getenv("LLAMACPP_MODEL", "gpt-oss-20b-mxfp4"))
 
     logger.info("Preloading models...")
 
@@ -471,17 +469,15 @@ def preload_models():
     except Exception as e:
         logger.warning(f"  Failed to preload STT model: {e}")
 
-    # Warm up Ollama LLM with correct num_ctx (loads model into VRAM)
+    # Warm up llama.cpp LLM (OpenAI-compatible endpoint)
     try:
-        logger.info(f"  Loading LLM: {ollama_model} (num_ctx={ollama_num_ctx})")
+        logger.info(f"  Loading LLM: {llamacpp_model}")
         response = requests.post(
-            f"{ollama_host}/api/generate",
+            f"{llamacpp_host}/chat/completions",
             json={
-                "model": ollama_model,
-                "prompt": "hi",
-                "stream": False,
-                "keep_alive": -1,
-                "options": {"num_ctx": ollama_num_ctx}
+                "model": llamacpp_model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 10,
             },
             timeout=180
         )

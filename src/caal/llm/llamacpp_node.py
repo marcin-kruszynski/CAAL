@@ -1,10 +1,10 @@
-"""Simplified Ollama LLM Node with think parameter support.
+"""llama.cpp LLM Node with OpenAI-compatible API.
 
-This module provides a custom llm_node implementation that bypasses LiveKit's
-LLM wrapper to enable direct Ollama calls with the `think` parameter.
+This module provides a custom llm_node implementation that uses llama.cpp server
+via OpenAI-compatible API.
 
 Key Features:
-- Direct Ollama API calls with think=False for lower latency (Qwen3)
+- Direct OpenAI-compatible API calls to llama.cpp server
 - Tool discovery from @function_tool methods and MCP servers
 - Tool execution routing (agent methods, n8n workflows, MCP tools)
 - Streaming responses for best UX
@@ -12,8 +12,8 @@ Key Features:
 Usage:
     class MyAgent(Agent):
         async def llm_node(self, chat_ctx, tools, model_settings):
-            async for chunk in ollama_llm_node(
-                self, chat_ctx, model="qwen3:8b", think=False
+            async for chunk in llamacpp_llm_node(
+                self, chat_ctx, model="gpt-oss-20b-mxfp4"
             ):
                 yield chunk
 """
@@ -25,7 +25,7 @@ import time
 from collections.abc import AsyncIterable
 from typing import Any
 
-import ollama
+from openai import OpenAI
 
 from ..utils.formatting import strip_markdown_for_tts
 from ..integrations.n8n import execute_n8n_workflow
@@ -66,38 +66,27 @@ class ToolDataCache:
         self._cache.clear()
 
 
-class OllamaLLMNode:
-    """Encapsulates Ollama LLM configuration and tool handling."""
+class LlamaCppLLMNode:
+    """Encapsulates llama.cpp LLM configuration and tool handling."""
 
     def __init__(
         self,
-        model: str = "qwen3:8b",
-        think: bool = False,
+        model: str = "gpt-oss-20b-mxfp4",
         temperature: float = 0.7,
         top_p: float = 0.8,
         top_k: int = 20,
     ):
         self.model = model
-        self.think = think
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
         self._tools_cache: list[dict] | None = None
 
-    def _get_ollama_options(self) -> dict:
-        """Get Ollama options dict."""
-        return {
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            "top_k": self.top_k,
-        }
 
-
-async def ollama_llm_node(
+async def llamacpp_llm_node(
     agent,
     chat_ctx,
-    model: str = "qwen3:8b",
-    think: bool = False,
+    model: str = "gpt-oss-20b-mxfp4",
     temperature: float = 0.7,
     top_p: float = 0.8,
     top_k: int = 20,
@@ -105,19 +94,18 @@ async def ollama_llm_node(
     tool_data_cache: ToolDataCache | None = None,
     max_turns: int = 20,
 ) -> AsyncIterable[str]:
-    """Custom LLM node using Ollama directly with think parameter support.
+    """Custom LLM node using llama.cpp server via OpenAI-compatible API.
 
     This function should be called from an Agent's llm_node method override.
 
     Args:
         agent: The Agent instance (self)
         chat_ctx: Chat context from LiveKit
-        model: Ollama model name
-        think: Enable thinking mode (False for lower latency with Qwen3)
+        model: Model name
         temperature: Sampling temperature
         top_p: Nucleus sampling threshold
-        top_k: Top-k sampling limit
-        num_ctx: Context window size
+        top_k: Top-k sampling limit (may not be supported by all servers)
+        num_ctx: Context window size (may not be supported by all servers)
         tool_data_cache: Cache for structured tool response data
         max_turns: Max conversation turns to keep in sliding window
 
@@ -127,15 +115,17 @@ async def ollama_llm_node(
     Example:
         class MyAgent(Agent):
             async def llm_node(self, chat_ctx, tools, model_settings):
-                async for chunk in ollama_llm_node(self, chat_ctx, think=False):
+                async for chunk in llamacpp_llm_node(self, chat_ctx):
                     yield chunk
     """
-    options = {
-        "temperature": temperature,
-        "top_p": top_p,
-        "top_k": top_k,
-        "num_ctx": num_ctx,
-    }
+    # Get base_url from agent's LLM instance
+    base_url = getattr(agent.llm, "base_url", "http://llama.home/v1")
+
+    # Initialize OpenAI client for llama.cpp server
+    client = OpenAI(
+        base_url=base_url,
+        api_key="not-needed",  # llama.cpp doesn't require auth
+    )
 
     try:
         # Build messages from chat context with sliding window
@@ -146,63 +136,75 @@ async def ollama_llm_node(
         )
 
         # Discover tools from agent and MCP servers
-        ollama_tools = await _discover_tools(agent)
+        openai_tools = await _discover_tools(agent)
+
+        # Prepare API parameters
+        api_params = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "top_p": top_p,
+            "stream": False,
+        }
 
         # If tools available, check for tool calls first (non-streaming)
-        if ollama_tools:
-            response = ollama.chat(
-                model=model,
-                messages=messages,
-                tools=ollama_tools,
-                think=think,
-                stream=False,
-                options=options,
-            )
+        if openai_tools:
+            api_params["tools"] = openai_tools
+            api_params["tool_choice"] = "auto"
 
-            if hasattr(response, "message"):
-                # Check for tool calls
-                if hasattr(response.message, "tool_calls") and response.message.tool_calls:
-                    tool_calls = response.message.tool_calls
-                    logger.info(f"Ollama returned {len(tool_calls)} tool call(s)")
+            response = client.chat.completions.create(**api_params)
 
-                    # Track tool usage for frontend indicator
-                    tool_names = [tc.function.name for tc in tool_calls]
-                    tool_params = [tc.function.arguments for tc in tool_calls]
+            # Check for tool calls
+            choice = response.choices[0] if response.choices else None
+            if choice and choice.message.tool_calls:
+                tool_calls = choice.message.tool_calls
+                logger.info(f"llama.cpp returned {len(tool_calls)} tool call(s)")
 
-                    # Publish tool status immediately (bullshit detector!)
-                    if hasattr(agent, "_on_tool_status") and agent._on_tool_status:
-                        import asyncio
-                        asyncio.create_task(agent._on_tool_status(True, tool_names, tool_params))
+                # Track tool usage for frontend indicator
+                tool_names = [tc.function.name for tc in tool_calls]
+                tool_params = []
+                for tc in tool_calls:
+                    # Parse JSON arguments
+                    try:
+                        args = json.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                    tool_params.append(args)
 
-                    # Execute tools and get results (cache structured data)
-                    messages = await _execute_tool_calls(
-                        agent, messages, tool_calls, response.message,
-                        tool_data_cache=tool_data_cache,
-                    )
+                # Publish tool status immediately
+                if hasattr(agent, "_on_tool_status") and agent._on_tool_status:
+                    import asyncio
+                    asyncio.create_task(agent._on_tool_status(True, tool_names, tool_params))
 
-                    # Stream follow-up response with tool results
-                    followup = ollama.chat(
-                        model=model,
-                        messages=messages,
-                        think=think,
-                        stream=True,
-                        options=options,
-                    )
+                # Execute tools and get results (cache structured data)
+                messages = await _execute_tool_calls(
+                    agent, messages, tool_calls, choice.message,
+                    tool_data_cache=tool_data_cache,
+                )
 
-                    for chunk in followup:
-                        if hasattr(chunk, "message") and hasattr(chunk.message, "content"):
-                            if chunk.message.content:
-                                yield strip_markdown_for_tts(chunk.message.content)
-                    return
+                # Stream follow-up response with tool results
+                followup_params = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "stream": True,
+                }
+                followup = client.chat.completions.create(**followup_params)
 
-                # No tool calls - return content directly
-                elif hasattr(response.message, "content") and response.message.content:
-                    # Publish no-tool status immediately
-                    if hasattr(agent, "_on_tool_status") and agent._on_tool_status:
-                        import asyncio
-                        asyncio.create_task(agent._on_tool_status(False, [], []))
-                    yield strip_markdown_for_tts(response.message.content)
-                    return
+                for chunk in followup:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        yield strip_markdown_for_tts(chunk.choices[0].delta.content)
+                return
+
+            # No tool calls - return content directly
+            elif choice and choice.message.content:
+                # Publish no-tool status immediately
+                if hasattr(agent, "_on_tool_status") and agent._on_tool_status:
+                    import asyncio
+                    asyncio.create_task(agent._on_tool_status(False, [], []))
+                yield strip_markdown_for_tts(choice.message.content)
+                return
 
         # No tools or no tool calls - stream directly
         # Publish no-tool status immediately
@@ -210,22 +212,21 @@ async def ollama_llm_node(
             import asyncio
             asyncio.create_task(agent._on_tool_status(False, [], []))
 
-        response_stream = ollama.chat(
-            model=model,
-            messages=messages,
-            tools=None,
-            think=think,
-            stream=True,
-            options=options,
-        )
+        stream_params = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "top_p": top_p,
+            "stream": True,
+        }
+        response_stream = client.chat.completions.create(**stream_params)
 
         for chunk in response_stream:
-            if hasattr(chunk, "message") and hasattr(chunk.message, "content"):
-                if chunk.message.content:
-                    yield strip_markdown_for_tts(chunk.message.content)
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield strip_markdown_for_tts(chunk.choices[0].delta.content)
 
     except Exception as e:
-        logger.error(f"Error in ollama_llm_node: {e}", exc_info=True)
+        logger.error(f"Error in llamacpp_llm_node: {e}", exc_info=True)
         yield f"I encountered an error: {e}"
 
 
@@ -234,7 +235,7 @@ def _build_messages_from_context(
     tool_data_cache: ToolDataCache | None = None,
     max_turns: int = 20,
 ) -> list[dict]:
-    """Build Ollama messages with sliding window and tool data context.
+    """Build OpenAI-compatible messages with sliding window and tool data context.
 
     Message order:
     1. System prompt (always first, never trimmed)
@@ -265,9 +266,10 @@ def _build_messages_from_context(
                     "content": "",
                     "tool_calls": [{
                         "id": item.id,
+                        "type": "function",
                         "function": {
                             "name": item.name,
-                            "arguments": getattr(item, "arguments", {}) or {},
+                            "arguments": json.dumps(getattr(item, "arguments", {}) or {}),
                         },
                     }],
                 })
@@ -315,10 +317,10 @@ async def _discover_tools(agent) -> list[dict] | None:
     redundant MCP API calls on every user utterance.
     """
     # Return cached tools if available
-    if hasattr(agent, "_ollama_tools_cache") and agent._ollama_tools_cache is not None:
-        return agent._ollama_tools_cache
+    if hasattr(agent, "_llamacpp_tools_cache") and agent._llamacpp_tools_cache is not None:
+        return agent._llamacpp_tools_cache
 
-    ollama_tools = []
+    openai_tools = []
 
     # Get @function_tool decorated methods from agent
     if hasattr(agent, "_tools") and agent._tools:
@@ -348,7 +350,7 @@ async def _discover_tools(agent) -> list[dict] | None:
                     if param.default == inspect.Parameter.empty and param_name != "self":
                         required.append(param_name)
 
-                ollama_tools.append({
+                openai_tools.append({
                     "type": "function",
                     "function": {
                         "name": name,
@@ -374,23 +376,23 @@ async def _discover_tools(agent) -> list[dict] | None:
             for tool in mcp_tools:
                 original_name = tool["function"]["name"]
                 tool["function"]["name"] = f"{server_name}__{original_name}"
-            ollama_tools.extend(mcp_tools)
+            openai_tools.extend(mcp_tools)
             if mcp_tools:
                 logger.info(f"Added {len(mcp_tools)} tools from MCP server: {server_name}")
 
     # Add n8n workflow tools (webhook-based execution, separate from MCP)
     if hasattr(agent, "_n8n_workflow_tools") and agent._n8n_workflow_tools:
-        ollama_tools.extend(agent._n8n_workflow_tools)
+        openai_tools.extend(agent._n8n_workflow_tools)
 
     # Cache tools on agent and return
-    result = ollama_tools if ollama_tools else None
-    agent._ollama_tools_cache = result
+    result = openai_tools if openai_tools else None
+    agent._llamacpp_tools_cache = result
 
     return result
 
 
 async def _get_mcp_tools(mcp_server) -> list[dict]:
-    """Get tools from an MCP server in Ollama format."""
+    """Get tools from an MCP server in OpenAI format."""
     tools = []
 
     if not mcp_server or not hasattr(mcp_server, "_client") or not mcp_server._client:
@@ -400,7 +402,7 @@ async def _get_mcp_tools(mcp_server) -> list[dict]:
         tools_result = await mcp_server._client.list_tools()
         if hasattr(tools_result, "tools"):
             for mcp_tool in tools_result.tools:
-                # Convert MCP schema to Ollama format
+                # Convert MCP schema to OpenAI format
                 parameters = {"type": "object", "properties": {}, "required": []}
                 if hasattr(mcp_tool, "inputSchema") and mcp_tool.inputSchema:
                     schema = mcp_tool.inputSchema
@@ -456,9 +458,10 @@ async def _execute_tool_calls(
     for tool_call in tool_calls:
         tool_call_message["tool_calls"].append({
             "id": getattr(tool_call, "id", ""),
+            "type": "function",
             "function": {
                 "name": tool_call.function.name,
-                "arguments": tool_call.function.arguments or {},
+                "arguments": tool_call.function.arguments if isinstance(tool_call.function.arguments, str) else json.dumps(tool_call.function.arguments),
             },
         })
 
@@ -467,7 +470,11 @@ async def _execute_tool_calls(
     # Execute each tool
     for tool_call in tool_calls:
         tool_name = tool_call.function.name
-        arguments = tool_call.function.arguments or {}
+        # Parse arguments (OpenAI sends as JSON string)
+        try:
+            arguments = json.loads(tool_call.function.arguments) if isinstance(tool_call.function.arguments, str) else (tool_call.function.arguments or {})
+        except (json.JSONDecodeError, TypeError):
+            arguments = {}
         logger.info(f"Executing tool: {tool_name} with args: {arguments}")
 
         try:
@@ -580,3 +587,4 @@ async def _call_mcp_tool(mcp_server, tool_name: str, arguments: dict) -> Any | N
         logger.warning(f"Error calling MCP tool {tool_name}: {e}")
 
     return None
+

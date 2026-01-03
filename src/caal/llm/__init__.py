@@ -1,8 +1,8 @@
 """
-LLM handling with Ollama direct integration.
+LLM handling with llama.cpp server integration.
 """
 
-from .ollama_llm import OllamaLLM
-from .ollama_node import OllamaLLMNode, ToolDataCache, ollama_llm_node
+from .llamacpp_llm import LlamaCppLLM
+from .llamacpp_node import LlamaCppLLMNode, ToolDataCache, llamacpp_llm_node
 
-__all__ = ["OllamaLLM", "OllamaLLMNode", "ToolDataCache", "ollama_llm_node"]
+__all__ = ["LlamaCppLLM", "LlamaCppLLMNode", "ToolDataCache", "llamacpp_llm_node"]

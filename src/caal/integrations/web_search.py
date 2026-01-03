@@ -1,8 +1,8 @@
-"""Web search tool with DuckDuckGo + Ollama summarization.
+"""Web search tool with DuckDuckGo + llama.cpp summarization.
 
 Provides a voice-friendly web search capability that:
 1. Searches DuckDuckGo (free, no API key)
-2. Summarizes results with Ollama for concise voice output
+2. Summarizes results with llama.cpp for concise voice output
 3. Returns 1-3 sentence answers instead of raw search results
 
 Usage:
@@ -14,7 +14,7 @@ import asyncio
 import logging
 from typing import Any
 
-import ollama
+from openai import OpenAI
 from livekit.agents import function_tool
 
 logger = logging.getLogger(__name__)
@@ -32,10 +32,10 @@ Summary:"""
 
 
 class WebSearchTools:
-    """Mixin providing web search via DuckDuckGo with Ollama summarization.
+    """Mixin providing web search via DuckDuckGo with llama.cpp summarization.
 
     Requires the parent class to have:
-    - self.llm: OllamaLLM instance (for model access)
+    - self.llm: LlamaCppLLM instance (for model access)
 
     Configuration (override in subclass if needed):
     - _search_max_results: int = 5
@@ -95,7 +95,7 @@ class WebSearchTools:
         query: str,
         results: list[dict[str, Any]]
     ) -> str:
-        """Summarize search results with Ollama for voice-friendly output."""
+        """Summarize search results with llama.cpp for voice-friendly output."""
 
         # Truncate to avoid exceeding context limits (~500 tokens total)
         formatted = []
@@ -107,18 +107,24 @@ class WebSearchTools:
         results_text = "\n".join(formatted)
         prompt = SUMMARIZE_PROMPT.format(query=query, results=results_text)
 
-        # Use agent's model for summarization
-        model = getattr(self.llm, "model", "qwen3:8b")
+        # Use agent's model and base_url for summarization
+        model = getattr(self.llm, "model", "gpt-oss-20b-mxfp4")
+        base_url = getattr(self.llm, "base_url", "http://llama.home/v1")
 
         try:
+            client = OpenAI(
+                base_url=base_url,
+                api_key="not-needed",  # llama.cpp doesn't require auth
+            )
+
             response = await asyncio.to_thread(
-                ollama.chat,
+                client.chat.completions.create,
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
-                options={"temperature": 0.3},  # Low temp for factual output
-                stream=False,
+                temperature=0.3,  # Low temp for factual output
+                max_tokens=200,
             )
-            summary = response.get("message", {}).get("content", "").strip()
+            summary = response.choices[0].message.content.strip() if response.choices else ""
             return summary or "I found some results but couldn't summarize them."
 
         except Exception as e:

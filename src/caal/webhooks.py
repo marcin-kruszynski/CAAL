@@ -181,7 +181,7 @@ async def reload_tools(req: ReloadToolsRequest) -> ReloadToolsResponse:
     logger.info(f"Reloading tools for room {req.room_name}")
 
     # Clear all caches
-    agent._ollama_tools_cache = None
+    agent._llamacpp_tools_cache = None
     n8n.clear_caches()
 
     # Re-discover n8n workflows if MCP is configured
@@ -455,29 +455,33 @@ async def get_voices() -> VoicesResponse:
 
 @app.get("/models", response_model=ModelsResponse)
 async def get_models() -> ModelsResponse:
-    """Get available LLM models from Ollama.
+    """Get available LLM models from llama.cpp server.
 
     Returns:
         ModelsResponse with list of model names
     """
-    ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+    llamacpp_host = os.getenv("LLAMACPP_HOST", os.getenv("OLLAMA_HOST", "http://llama.home/v1"))
 
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
-                f"{ollama_host}/api/tags",
+                f"{llamacpp_host}/models",
                 timeout=10.0,
             )
             response.raise_for_status()
             data = response.json()
 
-            # Ollama returns {"models": [{"name": "...", ...}, ...]}
-            models = [m.get("name") for m in data.get("models", [])]
+            # OpenAI-compatible API returns {"data": [{"id": "...", ...}, ...]}
+            if "data" in data:
+                models = [m.get("id") for m in data.get("data", [])]
+            else:
+                # Fallback: try direct list format
+                models = [m.get("id") if isinstance(m, dict) else str(m) for m in data if m]
             models = [m for m in models if m]  # Filter None values
 
             return ModelsResponse(models=models)
     except Exception as e:
-        logger.warning(f"Failed to fetch models from Ollama: {e}")
+        logger.warning(f"Failed to fetch models from llama.cpp: {e}")
         # Return empty list on failure
         return ModelsResponse(models=[])
 
