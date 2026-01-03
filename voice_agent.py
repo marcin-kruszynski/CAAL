@@ -13,10 +13,9 @@ Configuration:
     - prompt/default.md: Agent system prompt
 
 Environment Variables:
-    SPEACHES_URL        - Speaches STT service URL (default: "http://speaches:8000")
-    KOKORO_URL          - Kokoro TTS service URL (default: "http://kokoro:8880")
-    WHISPER_MODEL       - Whisper model for STT (default: "Systran/faster-whisper-small")
-    TTS_VOICE           - Kokoro voice name (default: "af_heart")
+    WYOMING_STT_URL     - Wyoming STT service URI (default: "tcp://nabu.home:10300")
+    WYOMING_TTS_URL     - Wyoming TTS service URI (default: "tcp://nabu.home:10200")
+    TTS_VOICE           - TTS voice name (default: "am_puck")
     OLLAMA_MODEL        - LLM model name (default: "gpt-oss-20b-mxfp4", kept for backward compatibility)
     LLAMACPP_HOST       - llama.cpp server URL (default: "http://llama.home/v1")
     TIMEZONE            - Timezone for date/time (default: "Pacific Time")
@@ -43,7 +42,7 @@ load_dotenv(os.path.join(_script_dir, ".env"))
 
 from livekit import agents
 from livekit.agents import AgentSession, Agent, RoomInputOptions, mcp
-from livekit.plugins import silero, openai
+from livekit.plugins import silero
 
 from caal import LlamaCppLLM
 from caal.integrations import (
@@ -54,7 +53,8 @@ from caal.integrations import (
 )
 from caal.llm import llamacpp_llm_node, ToolDataCache
 from caal import session_registry
-from caal.stt import WakeWordGatedSTT
+from caal.stt import WakeWordGatedSTT, WyomingSTT
+from caal.tts import WyomingTTS
 
 # Configure logging (LiveKit CLI reconfigures root logger, so set our level explicitly)
 logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
@@ -77,10 +77,8 @@ logging.getLogger("caal").setLevel(logging.INFO)  # Our package - INFO level
 # =============================================================================
 
 # Infrastructure config (from .env only - URLs, tokens, etc.)
-SPEACHES_URL = os.getenv("SPEACHES_URL", "http://speaches:8000")
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "Systran/faster-whisper-small")
-KOKORO_URL = os.getenv("KOKORO_URL", "http://kokoro:8880")
-TTS_MODEL = os.getenv("TTS_MODEL", "kokoro")  # "kokoro" for Kokoro-FastAPI, "prince-canuma/Kokoro-82M" for mlx-audio
+WYOMING_STT_URL = os.getenv("WYOMING_STT_URL", "tcp://nabu.home:10300")
+WYOMING_TTS_URL = os.getenv("WYOMING_TTS_URL", "tcp://nabu.home:10200")
 LLAMACPP_HOST = os.getenv("LLAMACPP_HOST", os.getenv("OLLAMA_HOST", "http://llama.home/v1"))
 TIMEZONE_ID = os.getenv("TIMEZONE", "America/Los_Angeles")
 TIMEZONE_DISPLAY = os.getenv("TIMEZONE_DISPLAY", "Pacific Time")
@@ -232,8 +230,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     logger.info("=" * 60)
     logger.info("STARTING VOICE AGENT")
     logger.info("=" * 60)
-    logger.info(f"  STT: {SPEACHES_URL} ({WHISPER_MODEL})")
-    logger.info(f"  TTS: {KOKORO_URL} ({runtime['tts_voice']})")
+    logger.info(f"  STT: {WYOMING_STT_URL} (Wyoming)")
+    logger.info(f"  TTS: {WYOMING_TTS_URL} (voice={runtime['tts_voice']})")
     logger.info(
         f"  LLM: llama.cpp ({runtime['model']}, num_ctx={runtime['num_ctx']}, base_url={LLAMACPP_HOST})"
     )
@@ -241,11 +239,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     logger.info("=" * 60)
 
     # Build STT - optionally wrapped with wake word detection
-    base_stt = openai.STT(
-        base_url=f"{SPEACHES_URL}/v1",
-        api_key="not-needed",  # Speaches doesn't require auth
-        model=WHISPER_MODEL,
-    )
+    base_stt = WyomingSTT(uri=WYOMING_STT_URL)
 
     # Load wake word settings
     all_settings = settings_module.load_settings()
@@ -320,16 +314,14 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         stt_instance = base_stt
         logger.info("  Wake word: disabled")
 
-    # Create session with Speaches STT and Kokoro TTS (both OpenAI-compatible)
+    # Create session with Wyoming STT and TTS
     logger.info(f"  STT instance type: {type(stt_instance).__name__}")
     logger.info(f"  STT capabilities: streaming={stt_instance.capabilities.streaming}")
     session = AgentSession(
         stt=stt_instance,
         llm=llamacpp_llm,
-        tts=openai.TTS(
-            base_url=f"{KOKORO_URL}/v1",
-            api_key="not-needed",  # Kokoro doesn't require auth
-            model=TTS_MODEL,
+        tts=WyomingTTS(
+            uri=WYOMING_TTS_URL,
             voice=runtime["tts_voice"],
         ),
         vad=silero.VAD.load(),
@@ -441,33 +433,17 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
 
 def preload_models():
-    """Preload STT and LLM models on startup.
+    """Preload LLM models on startup.
 
     Ensures models are ready before first user connection, avoiding
     delays on first request (especially important on HDDs).
 
-    Note: Kokoro (remsky/kokoro-fastapi) preloads its own models at startup.
+    Note: Wyoming STT/TTS services handle their own model loading.
     """
-    speaches_url = os.getenv("SPEACHES_URL", "http://speaches:8000")
-    whisper_model = os.getenv("WHISPER_MODEL", "Systran/faster-whisper-medium")
     llamacpp_host = os.getenv("LLAMACPP_HOST", os.getenv("OLLAMA_HOST", "http://llama.home/v1"))
     llamacpp_model = os.getenv("OLLAMA_MODEL", os.getenv("LLAMACPP_MODEL", "gpt-oss-20b-mxfp4"))
 
     logger.info("Preloading models...")
-
-    # Download Whisper STT model
-    try:
-        logger.info(f"  Loading STT: {whisper_model}")
-        response = requests.post(
-            f"{speaches_url}/v1/models/{whisper_model}",
-            timeout=300
-        )
-        if response.status_code == 200:
-            logger.info("  ✓ STT ready")
-        else:
-            logger.warning(f"  STT model download returned {response.status_code}")
-    except Exception as e:
-        logger.warning(f"  Failed to preload STT model: {e}")
 
     # Warm up llama.cpp LLM (OpenAI-compatible endpoint)
     try:

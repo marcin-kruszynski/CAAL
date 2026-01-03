@@ -16,7 +16,7 @@ keywords = [
     "mcp",
     "n8n",
     "llamacpp",
-    "speaches",
+    "wyoming",
     "local",
     "self-hosted"
 ]
@@ -52,6 +52,9 @@ dependencies = [
 
     # Wake word detection
     "openwakeword>=0.6.0",
+
+    # Wyoming protocol for STT/TTS
+    "wyoming>=0.1.0",
 ]
 
 [project.optional-dependencies]

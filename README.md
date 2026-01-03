@@ -6,11 +6,11 @@
 
 **Local voice assistant that learns new abilities via auto-discovered n8n workflows exposed as tools via MCP**
 
-Built on [LiveKit Agents](https://docs.livekit.io/agents/) with fully local STT/TTS/LLM using [Speaches](https://github.com/speaches-ai/speaches) (Faster-Whisper STT), [Kokoro](https://github.com/remsky/Kokoro-FastAPI) (TTS), and [Ollama](https://ollama.ai/).
+Built on [LiveKit Agents](https://docs.livekit.io/agents/) with fully local STT/TTS/LLM using Wyoming protocol (faster-whisper-wyoming for STT, piper-wyoming for TTS) and [Ollama](https://ollama.ai/).
 
 ## Features
 
-- **Local Voice Pipeline**: Speaches (Faster-Whisper STT) + Kokoro (TTS) + Ollama LLM
+- **Local Voice Pipeline**: Wyoming protocol STT/TTS (faster-whisper-wyoming + piper-wyoming) + Ollama LLM
 - **Wake Word Detection**: "Hey Cal" activation via Picovoice Porcupine
 - **n8n Integrations**: Home Assistant, APIs, databases - anything n8n can connect to
 - **Web Search**: DuckDuckGo integration for real-time information
@@ -172,13 +172,13 @@ Quick start:
 ┌───────────────────────────────────────────────────────────────────────┐
 │  Docker Compose Stack                                                 │
 │                                                                       │
-│  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐       │
-│  │  Frontend  │  │  LiveKit   │  │  Speaches  │  │   Kokoro   │       │
-│  │  (Next.js) │  │   Server   │  │ (STT, GPU) │  │ (TTS, GPU) │       │
-│  │   :3000    │  │   :7880    │  │   :8000    │  │   :8880    │       │
-│  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘       │
-│        │               │               │               │              │
-│        │               └───────────────┼───────────────┘              │
+│  ┌────────────┐  ┌────────────┐                                      │
+│  │  Frontend  │  │  LiveKit   │                                      │
+│  │  (Next.js) │  │   Server   │                                      │
+│  │   :3000    │  │   :7880    │                                      │
+│  └─────┬──────┘  └─────┬──────┘                                      │
+│        │               │                                              │
+│        │               │                                              │
 │        └───────────────────────┐       │                              │
 │                                │       │                              │
 │                          ┌─────┴───────┴─────┐                        │
@@ -189,12 +189,12 @@ Quick start:
 │                                    │                                  │
 └────────────────────────────────────┼──────────────────────────────────┘
                                      │
-                   ┌─────────────────┼─────────────────┐
-                   │                 │                 │
-             ┌─────┴─────┐     ┌─────┴─────┐     ┌─────┴─────┐
-             │  Ollama   │     │    n8n    │     │   Your    │
-             │   (LLM)   │     │ Workflows │     │   APIs    │
-             └───────────┘     └───────────┘     └───────────┘
+                   ┌─────────────────┼─────────────────┬─────────────────┐
+                   │                 │                 │                 │
+             ┌─────┴─────┐     ┌─────┴─────┐     ┌─────┴─────┐     ┌─────┴─────┐
+             │  Ollama   │     │    n8n    │     │ Wyoming  │     │   Your    │
+             │   (LLM)   │     │ Workflows │     │ STT/TTS  │     │   APIs    │
+             └───────────┘     └───────────┘     └───────────┘     └───────────┘
                     External Services (on your network)
 ```
 
@@ -207,10 +207,9 @@ Quick start:
 | `CAAL_HOST_IP` | Your server's LAN IP (required for WebRTC) | - |
 | `N8N_MCP_URL` | n8n MCP server URL (required) | - |
 | `LIVEKIT_URL` | LiveKit server URL | `ws://localhost:7880` |
-| `SPEACHES_URL` | Speaches STT server URL | `http://localhost:8000` |
-| `KOKORO_URL` | Kokoro TTS server URL | `http://localhost:8880` |
-| `WHISPER_MODEL` | Faster-Whisper model | `Systran/faster-whisper-medium` |
-| `TTS_VOICE` | Kokoro voice name | `am_puck` |
+| `WYOMING_STT_URL` | Wyoming STT service URI | `tcp://nabu.home:10300` |
+| `WYOMING_TTS_URL` | Wyoming TTS service URI | `tcp://nabu.home:10200` |
+| `TTS_VOICE` | TTS voice name | `am_puck` |
 | `OLLAMA_HOST` | Ollama server URL | `http://localhost:11434` |
 | `OLLAMA_MODEL` | LLM model name | `ministral-3:8b` |
 | `OLLAMA_THINK` | Enable thinking mode (slower) | `false` |
@@ -314,8 +313,8 @@ See `mobile/README.md` for full documentation.
 # Install dependencies
 uv sync
 
-# Start infrastructure (LiveKit + Speaches + Kokoro)
-docker compose up -d livekit speaches kokoro
+# Start infrastructure (LiveKit only - Wyoming STT/TTS are external)
+docker compose up -d livekit
 
 # Run agent locally
 uv run voice_agent.py dev
@@ -387,11 +386,8 @@ caal/
 # Check agent logs
 docker compose logs -f agent
 
-# Verify Speaches (STT) is healthy
-curl http://localhost:8000/health
-
-# Verify Kokoro (TTS) is healthy
-curl http://localhost:8880/health
+# Verify Wyoming STT/TTS services are accessible
+# (These are external services, verify they're running on your network)
 
 # Verify Ollama is reachable
 curl http://YOUR_OLLAMA_IP:11434/api/tags
@@ -436,10 +432,7 @@ ollama run qwen3:8b  # or your configured model
 
 ### First Start Is Slow
 
-Normal - models download on first run (~2-5 minutes). Watch with:
-```bash
-docker compose logs -f speaches kokoro
-```
+Normal - models download on first run (~2-5 minutes). Wyoming STT/TTS services handle their own model loading.
 
 ## Production Hardening
 
@@ -466,13 +459,14 @@ Both use the same `--profile https` and nginx for TLS termination.
 
 2. **Wake Word Models**: The Python `.ppn` models don't work in browser - you need the Web (WASM) version from Picovoice.
 
-3. **RTX 50 Series (Blackwell) Support**: Kokoro TTS requires `v0.2.4-master` or later for RTX 5080/5090 (sm_120) support. This is already configured in `docker-compose.yaml`.
+3. **Wyoming Services**: Ensure your Wyoming STT (faster-whisper-wyoming) and TTS (piper-wyoming) services are running and accessible at the configured URIs.
 
 ## Related Projects
 
 - [LiveKit Agents](https://github.com/livekit/agents) - Voice agent framework
-- [Speaches](https://github.com/speaches-ai/speaches) - Faster-Whisper STT server (NVIDIA GPU)
-- [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) - Kokoro TTS server (NVIDIA GPU)
+- [Wyoming Protocol](https://github.com/rhasspy/wyoming) - Protocol for voice assistant services
+- [faster-whisper-wyoming](https://github.com/rhasspy/wyoming-faster-whisper) - Faster-Whisper STT server (Wyoming protocol)
+- [piper-wyoming](https://github.com/rhasspy/wyoming-piper) - Piper TTS server (Wyoming protocol)
 - [mlx-audio](https://github.com/Blaizzy/mlx-audio) - STT/TTS for Apple Silicon (Metal)
 - [Ollama](https://ollama.ai/) - Local LLM server
 - [n8n](https://n8n.io/) - Workflow automation

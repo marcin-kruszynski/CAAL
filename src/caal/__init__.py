@@ -8,8 +8,8 @@ Core Components:
     LlamaCppLLM: llama.cpp server LLM with OpenAI-compatible API
 
 STT/TTS:
-    - Speaches container for Faster-Whisper STT
-    - Kokoro container for TTS
+    - Wyoming protocol STT (faster-whisper-wyoming)
+    - Wyoming protocol TTS (piper-wyoming)
 
 Integrations:
     n8n: Workflow discovery and execution via n8n MCP

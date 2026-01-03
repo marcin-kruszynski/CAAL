@@ -424,33 +424,52 @@ async def save_prompt(req: PromptUpdateRequest) -> PromptResponse:
 
 @app.get("/voices", response_model=VoicesResponse)
 async def get_voices() -> VoicesResponse:
-    """Get available TTS voices from Kokoro.
+    """Get available TTS voices from Wyoming TTS service.
 
     Returns:
         VoicesResponse with list of voice IDs
     """
-    kokoro_url = os.getenv("KOKORO_URL", "http://kokoro:8880")
+    wyoming_tts_url = os.getenv("WYOMING_TTS_URL", "tcp://nabu.home:10200")
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{kokoro_url}/v1/audio/voices",
-                timeout=10.0,
-            )
-            response.raise_for_status()
-            data = response.json()
+        from wyoming.client import AsyncClient
+        from wyoming.info import Describe, Info
+        from wyoming.tts import SynthesizeSpeakers
 
-            # Kokoro returns {"voices": [{"id": "...", ...}, ...]}
-            voices = [v.get("id") or v.get("voice_id") for v in data.get("voices", [])]
-            voices = [v for v in voices if v]  # Filter None values
+        async with AsyncClient(wyoming_tts_url) as client:
+            # Request server info
+            await client.write_event(Describe().event())
+            event = await client.read_event()
+            
+            if event and isinstance(event, Info) and event.tts:
+                # Extract voices from TTS info
+                voices = []
+                if event.tts.speakers:
+                    voices = [s.name for s in event.tts.speakers]
+                elif event.tts.voices:
+                    voices = [v.name for v in event.tts.voices]
+                
+                if voices:
+                    return VoicesResponse(voices=voices)
+            
+            # Try to get speakers via SynthesizeSpeakers
+            await client.write_event(SynthesizeSpeakers().event())
+            while True:
+                event = await client.read_event()
+                if event is None:
+                    break
+                if isinstance(event, SynthesizeSpeakers):
+                    if event.speakers:
+                        voices = [s.name for s in event.speakers]
+                        return VoicesResponse(voices=voices)
+                    break
 
-            return VoicesResponse(voices=voices)
+        # No voices found, return empty list
+        return VoicesResponse(voices=[])
     except Exception as e:
-        logger.warning(f"Failed to fetch voices from Kokoro: {e}")
-        # Return default voices as fallback
-        return VoicesResponse(
-            voices=["af_heart", "af_bella", "af_sarah", "am_adam", "am_puck"]
-        )
+        logger.warning(f"Failed to fetch voices from Wyoming TTS: {e}")
+        # Return empty list as fallback
+        return VoicesResponse(voices=[])
 
 
 @app.get("/models", response_model=ModelsResponse)

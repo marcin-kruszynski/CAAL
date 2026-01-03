@@ -1,6 +1,6 @@
 """Wake word gated STT wrapper using OpenWakeWord.
 
-Uses StreamAdapter for inner STT (since Speaches doesn't support WebSocket streaming).
+Uses StreamAdapter for inner STT to handle VAD and batch processing.
 Wake word detection gates when audio gets forwarded to the StreamAdapter.
 """
 
@@ -159,7 +159,7 @@ class WakeWordGatedSTT(STT):
 class WakeWordGatedStream(RecognizeStream):
     """Streaming STT that gates audio through wake word detection.
 
-    Uses StreamAdapter for inner STT since Speaches doesn't support WebSocket streaming.
+    Uses StreamAdapter for inner STT to handle VAD and batch processing.
     Flow:
     1. LISTENING: Run wake word detection on all audio, discard if no trigger
     2. Wake word detected: Switch to ACTIVE, trigger greeting callback
