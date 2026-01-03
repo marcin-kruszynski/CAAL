@@ -58,7 +58,8 @@ mcp_servers.json
 *.bin
 *.pt
 *.pth
-/models/
+/models/*
+!models/.gitkeep
 
 # Logs
 *.log

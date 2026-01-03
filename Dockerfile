@@ -52,15 +52,24 @@ COPY --from=deps /app/.venv /app/.venv
 COPY --chown=agent:agent src/ ./src/
 COPY --chown=agent:agent voice_agent.py ./
 COPY --chown=agent:agent prompt/ ./prompt/
-COPY --chown=agent:agent models/ ./models/
 COPY --chown=agent:agent settings.default.json mcp_servers.default.json ./
 COPY --chown=agent:agent entrypoint.sh ./
 
+# Copy models directory (models/ is gitignored, directory may be empty)
+# Create empty directory first to ensure it exists, then copy contents if any
+RUN mkdir -p /app/models
+COPY --chown=agent:agent models/ ./models/
+
 # Copy OpenWakeWord resource models to the package location
 # These are required for the melspectrogram and embedding preprocessors
+# Only copy if the files exist
 RUN mkdir -p /app/.venv/lib/python3.11/site-packages/openwakeword/resources/models && \
-    cp /app/models/melspectrogram.onnx /app/models/embedding_model.onnx \
-    /app/.venv/lib/python3.11/site-packages/openwakeword/resources/models/
+    if [ -f /app/models/melspectrogram.onnx ] && [ -f /app/models/embedding_model.onnx ]; then \
+        cp /app/models/melspectrogram.onnx /app/models/embedding_model.onnx \
+        /app/.venv/lib/python3.11/site-packages/openwakeword/resources/models/; \
+    else \
+        echo "Warning: OpenWakeWord model files not found in /app/models/ - they may need to be downloaded at runtime"; \
+    fi
 
 # Set environment variables
 ENV PATH="/app/.venv/bin:$PATH"
