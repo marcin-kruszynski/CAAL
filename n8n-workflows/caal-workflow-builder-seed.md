@@ -224,7 +224,7 @@ Webhook (POST) → Respond Immediately ("On it, I'll let you know when ready")
 {
   "parameters": {
     "method": "POST",
-    "url": "http://{{CAAL_HOST}}/announce",
+    "url": "http://nabu.home:8889/announce",
     "sendBody": true,
     "specifyBody": "json",
     "jsonBody": "={\"message\": \"Your task is complete.\"}"

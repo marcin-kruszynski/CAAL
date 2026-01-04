@@ -434,9 +434,8 @@ async def get_voices() -> VoicesResponse:
     try:
         from wyoming.client import AsyncClient
         from wyoming.info import Describe, Info
-        from wyoming.tts import SynthesizeSpeakers
 
-        async with AsyncClient(wyoming_tts_url) as client:
+        async with AsyncClient.from_uri(wyoming_tts_url) as client:
             # Request server info
             await client.write_event(Describe().event())
             event = await client.read_event()
@@ -451,18 +450,6 @@ async def get_voices() -> VoicesResponse:
                 
                 if voices:
                     return VoicesResponse(voices=voices)
-            
-            # Try to get speakers via SynthesizeSpeakers
-            await client.write_event(SynthesizeSpeakers().event())
-            while True:
-                event = await client.read_event()
-                if event is None:
-                    break
-                if isinstance(event, SynthesizeSpeakers):
-                    if event.speakers:
-                        voices = [s.name for s in event.speakers]
-                        return VoicesResponse(voices=voices)
-                    break
 
         # No voices found, return empty list
         return VoicesResponse(voices=[])

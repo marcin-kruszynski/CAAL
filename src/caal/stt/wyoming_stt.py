@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 import numpy as np
 from livekit import rtc
 from livekit.agents.stt import (
     RecognizeStream,
+    SpeechData,
     SpeechEvent,
     SpeechEventType,
     STT,
@@ -24,7 +26,9 @@ from livekit.agents.utils import aio
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.client import AsyncClient
 from wyoming.info import Describe, Info
-from wyoming.stt import Transcript
+from wyoming.asr import Transcript, TranscriptChunk, Transcribe
+
+from ..ndjson_log import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +54,11 @@ class WyomingSTT(STT):
             model: Optional model name (if not provided, uses server default)
         """
         super().__init__(
-            capabilities=STTCapabilities(streaming=True, interim_results=False)
+            # NOTE: Many Wyoming ASR servers only emit transcripts after AudioStop.
+            # LiveKit's VAD-based turn detection expects transcripts to exist before it
+            # commits/flushes a user turn, so advertising streaming=True can deadlock.
+            # Mark as non-streaming so LiveKit wraps it with stt.StreamAdapter + VAD.
+            capabilities=STTCapabilities(streaming=False, interim_results=False)
         )
         self._uri = uri
         self._model = model
@@ -73,7 +81,7 @@ class WyomingSTT(STT):
     async def _ensure_info(self) -> Info:
         """Get server info if not already cached."""
         if self._info is None:
-            async with AsyncClient(self._uri) as client:
+            async with AsyncClient.from_uri(self._uri) as client:
                 await client.write_event(Describe().event())
                 event = await client.read_event()
                 if event and isinstance(event, Info):
@@ -91,10 +99,28 @@ class WyomingSTT(STT):
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> SpeechEvent:
         """Perform non-streaming recognition."""
+        log_event(
+            hypothesis_id="R",
+            location="wyoming_stt.py:_recognize_impl",
+            message="Recognize called",
+            data={
+                "buffer_sample_rate": buffer.sample_rate,
+                "buffer_num_channels": buffer.num_channels,
+                "buffer_len_bytes": len(buffer.data),
+            },
+        )
         # Convert audio buffer to PCM format
         audio_data = self._convert_audio_to_pcm(buffer)
 
-        async with AsyncClient(self._uri) as client:
+        async with AsyncClient.from_uri(self._uri) as client:
+            # Some Wyoming ASR servers require an explicit Transcribe request
+            try:
+                lang = None if language is NOT_GIVEN else language
+                await client.write_event(Transcribe(name=self._model, language=lang).event())
+            except Exception:
+                # Best-effort: continue even if server doesn't support Transcribe
+                pass
+
             # Send audio start
             await client.write_event(
                 AudioStart(
@@ -105,7 +131,14 @@ class WyomingSTT(STT):
             )
 
             # Send audio data
-            await client.write_event(AudioChunk(audio=audio_data).event())
+            await client.write_event(
+                AudioChunk(
+                    rate=WYOMING_SAMPLE_RATE,
+                    width=WYOMING_WIDTH,
+                    channels=WYOMING_CHANNELS,
+                    audio=audio_data,
+                ).event()
+            )
 
             # Send audio stop
             await client.write_event(AudioStop().event())
@@ -115,17 +148,26 @@ class WyomingSTT(STT):
                 event = await client.read_event()
                 if event is None:
                     break
-                if isinstance(event, Transcript):
+                # wyoming client returns a generic Event; decode by type
+                if Transcript.is_type(getattr(event, "type", "")):
+                    tr = Transcript.from_event(event)
+                    log_event(
+                        hypothesis_id="R",
+                        location="wyoming_stt.py:_recognize_impl",
+                        message="Recognize got Transcript",
+                        data={"text_preview": (tr.text or "")[:160], "language": tr.language or None},
+                    )
                     return SpeechEvent(
                         type=SpeechEventType.FINAL_TRANSCRIPT,
-                        alternatives=[SpeechEvent.Alternative(text=event.text)],
-                        language=event.language,
+                        alternatives=[
+                            SpeechData(language=tr.language or "", text=tr.text or "", confidence=0.0)
+                        ],
                     )
 
         # No transcription received
         return SpeechEvent(
             type=SpeechEventType.FINAL_TRANSCRIPT,
-            alternatives=[SpeechEvent.Alternative(text="")],
+            alternatives=[SpeechData(language="", text="", confidence=0.0)],
         )
 
     def stream(
@@ -199,8 +241,16 @@ class WyomingSTTStream(RecognizeStream):
     async def _run(self) -> None:
         """Main processing loop."""
         try:
-            self._client = AsyncClient(self._uri)
+            self._client = AsyncClient.from_uri(self._uri)
             await self._client.__aenter__()
+
+            # Send ASR transcribe request (required by many Wyoming ASR servers)
+            try:
+                language = None if self._language is NOT_GIVEN else self._language
+                name = self._model
+                await self._client.write_event(Transcribe(name=name, language=language).event())
+            except Exception as e:
+                logger.error(f"Failed to send Transcribe to Wyoming: {e}", exc_info=True)
 
             # Send audio start
             await self._client.write_event(
@@ -214,49 +264,87 @@ class WyomingSTTStream(RecognizeStream):
             # Process audio frames
             async def _process_audio() -> None:
                 """Process incoming audio frames."""
-                async for data in self._input_ch:
-                    if isinstance(data, self._FlushSentinel):
-                        # Flush: send accumulated audio and stop
-                        if self._audio_buffer:
-                            audio_data = b"".join(self._audio_buffer)
+                frame_count = 0
+                try:
+                    async for data in self._input_ch:
+                        if isinstance(data, self._FlushSentinel):
+                            # Flush: send accumulated audio and stop
+                            if self._audio_buffer:
+                                audio_data = b"".join(self._audio_buffer)
+                                await self._client.write_event(
+                                        AudioChunk(
+                                            rate=WYOMING_SAMPLE_RATE,
+                                            width=WYOMING_WIDTH,
+                                            channels=WYOMING_CHANNELS,
+                                            audio=audio_data,
+                                        ).event()
+                                )
+                                self._audio_buffer = []
+                            await self._client.write_event(AudioStop().event())
+                            continue
+
+                        frame: rtc.AudioFrame = data
+                        frame_count += 1
+                        audio_data = self._convert_frame_to_pcm(frame)
+                        self._audio_buffer.append(audio_data)
+
+                        # Send chunks periodically (every ~100ms)
+                        if len(b"".join(self._audio_buffer)) >= (
+                            WYOMING_SAMPLE_RATE * WYOMING_WIDTH * WYOMING_CHANNELS * 0.1
+                        ):
+                            audio_chunk = b"".join(self._audio_buffer)
                             await self._client.write_event(
-                                AudioChunk(audio=audio_data).event()
+                                AudioChunk(
+                                    rate=WYOMING_SAMPLE_RATE,
+                                    width=WYOMING_WIDTH,
+                                    channels=WYOMING_CHANNELS,
+                                    audio=audio_chunk,
+                                ).event()
                             )
                             self._audio_buffer = []
-                        await self._client.write_event(AudioStop().event())
-                        continue
-
-                    frame: rtc.AudioFrame = data
-                    audio_data = self._convert_frame_to_pcm(frame)
-                    self._audio_buffer.append(audio_data)
-
-                    # Send chunks periodically (every ~100ms)
-                    if len(b"".join(self._audio_buffer)) >= (
-                        WYOMING_SAMPLE_RATE * WYOMING_WIDTH * WYOMING_CHANNELS * 0.1
-                    ):
-                        audio_chunk = b"".join(self._audio_buffer)
-                        await self._client.write_event(
-                            AudioChunk(audio=audio_chunk).event()
-                        )
-                        self._audio_buffer = []
+                except Exception as e:
+                    logger.error(f"Error in audio processing loop: {e}")
+                    raise
 
             async def _read_transcripts() -> None:
                 """Read transcription events from Wyoming."""
+                event_count = 0
                 while True:
                     try:
                         event = await self._client.read_event()
                         if event is None:
                             break
-                        if isinstance(event, Transcript):
-                            if event.text:
-                                # Emit final transcript
+                        event_count += 1
+
+                        # wyoming client returns a generic Event; decode by type
+                        if TranscriptChunk.is_type(event.type):
+                            chunk = TranscriptChunk.from_event(event)
+                            if chunk.text:
+                                self._event_ch.send_nowait(
+                                    SpeechEvent(
+                                        type=SpeechEventType.INTERIM_TRANSCRIPT,
+                                        alternatives=[
+                                            SpeechData(
+                                                language=getattr(chunk, "language", "") or "",
+                                                text=chunk.text or "",
+                                                confidence=getattr(chunk, "confidence", 0.0) or 0.0,
+                                            )
+                                        ],
+                                    )
+                                )
+                        elif Transcript.is_type(event.type):
+                            tr = Transcript.from_event(event)
+                            if tr.text:
                                 self._event_ch.send_nowait(
                                     SpeechEvent(
                                         type=SpeechEventType.FINAL_TRANSCRIPT,
                                         alternatives=[
-                                            SpeechEvent.Alternative(text=event.text)
+                                            SpeechData(
+                                                language=tr.language or "",
+                                                text=tr.text or "",
+                                                confidence=getattr(tr, "confidence", 0.0) or 0.0,
+                                            )
                                         ],
-                                        language=event.language,
                                     )
                                 )
                     except Exception as e:
@@ -279,7 +367,12 @@ class WyomingSTTStream(RecognizeStream):
                     if self._audio_buffer:
                         audio_data = b"".join(self._audio_buffer)
                         await self._client.write_event(
-                            AudioChunk(audio=audio_data).event()
+                            AudioChunk(
+                                rate=WYOMING_SAMPLE_RATE,
+                                width=WYOMING_WIDTH,
+                                channels=WYOMING_CHANNELS,
+                                audio=audio_data,
+                            ).event()
                         )
                     await self._client.write_event(AudioStop().event())
                     await self._client.__aexit__(None, None, None)

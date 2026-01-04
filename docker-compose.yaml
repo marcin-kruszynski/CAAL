@@ -22,15 +22,70 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
+        # #region agent log
+        echo "DEBUG: CAAL_HOST_IP=$${CAAL_HOST_IP}" > /tmp/debug_env.txt
+        echo "DEBUG: HTTPS_DOMAIN=$${HTTPS_DOMAIN}" >> /tmp/debug_env.txt
+        # #endregion
+        # Resolve CAAL_HOST_IP to actual IP if it's a hostname
+        # LiveKit requires --node-ip to be an IP address for TURN relay to work
+        # Check if CAAL_HOST_IP looks like an IP address (contains only digits and dots)
+        if echo "$${CAAL_HOST_IP}" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$$'; then
+          NODE_IP="$${CAAL_HOST_IP}"
+          # #region agent log
+          echo "DEBUG: CAAL_HOST_IP is already an IP: $${NODE_IP}" >> /tmp/debug_env.txt
+          # #endregion
+        else
+          # It's a hostname, resolve it to IP
+          # Install bind-tools if not available (for nslookup)
+          apk add --no-cache bind-tools > /dev/null 2>&1 || true
+          # Try multiple resolution methods
+          NODE_IP=$$(getent hosts "$${CAAL_HOST_IP}" 2>/dev/null | awk '{print $1}' | head -n1)
+          if [ -z "$${NODE_IP}" ]; then
+            # Try nslookup
+            NODE_IP=$$(nslookup "$${CAAL_HOST_IP}" 2>/dev/null | grep -A1 "Name:" | tail -1 | awk '{print $2}' || echo "")
+          fi
+          if [ -z "$${NODE_IP}" ]; then
+            # Last resort: try ping (some systems resolve via ping)
+            NODE_IP=$$(ping -c 1 -W 1 "$${CAAL_HOST_IP}" 2>/dev/null | grep -oP 'PING \K[^(]+' | head -n1 || echo "")
+          fi
+          if [ -z "$${NODE_IP}" ]; then
+            # If all resolution fails, use hostname as-is and let LiveKit handle it
+            NODE_IP="$${CAAL_HOST_IP}"
+            # #region agent log
+            echo "WARNING: Could not resolve $${CAAL_HOST_IP} to IP, using hostname" >> /tmp/debug_env.txt
+            # #endregion
+          fi
+          # #region agent log
+          echo "DEBUG: Resolved hostname $${CAAL_HOST_IP} to IP: $${NODE_IP}" >> /tmp/debug_env.txt
+          # #endregion
+        fi
+        # #region agent log
+        echo "DEBUG: Final NODE_IP=$${NODE_IP} (will be used for --node-ip and TURN relay)" >> /tmp/debug_env.txt
+        # #endregion
         if [ -n "$${HTTPS_DOMAIN}" ]; then
           echo "HTTPS mode: enabling TURN/TLS for $${HTTPS_DOMAIN}"
           apk add --no-cache gettext > /dev/null 2>&1
+          # #region agent log
+          echo "DEBUG: Before envsubst, template exists: $([ -f /etc/livekit.yaml.template ] && echo 'yes' || echo 'no')" >> /tmp/debug_env.txt
+          # #endregion
           envsubst < /etc/livekit.yaml.template > /etc/livekit.yaml
+          # #region agent log
+          echo "DEBUG: After envsubst, config exists: $([ -f /etc/livekit.yaml ] && echo 'yes' || echo 'no')" >> /tmp/debug_env.txt
+          echo "DEBUG: Generated TURN config:" >> /tmp/debug_env.txt
+          grep -A10 "^turn:" /etc/livekit.yaml >> /tmp/debug_env.txt || echo "TURN config not found" >> /tmp/debug_env.txt
+          # #endregion
         else
           echo "LAN mode: using basic config"
           cp /etc/livekit-lan.yaml /etc/livekit.yaml
+          # #region agent log
+          echo "DEBUG: LAN mode, NODE_IP value for --node-ip: $${NODE_IP}" >> /tmp/debug_env.txt
+          # #endregion
         fi
-        exec /livekit-server --config /etc/livekit.yaml --node-ip $${CAAL_HOST_IP}
+        # #region agent log
+        echo "DEBUG: About to start livekit-server with --node-ip=$${NODE_IP}" >> /tmp/debug_env.txt
+        cat /tmp/debug_env.txt
+        # #endregion
+        exec /livekit-server --config /etc/livekit.yaml --node-ip "$${NODE_IP}"
     ports:
       - "7880:7880"       # WebSocket
       - "7881:7881"       # TCP for WebRTC
@@ -74,10 +129,17 @@ services:
       - ./.env
     environment:
       - LIVEKIT_URL=ws://livekit:7880
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY:-devkey}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET:-u_nnSY8qsRbA3AI1-HzRHCqM_eujNA2cEtr2Wl3JNMk}
       - WYOMING_STT_URL=${WYOMING_STT_URL:-tcp://nabu.home:10300}
       - WYOMING_TTS_URL=${WYOMING_TTS_URL:-tcp://nabu.home:10200}
+      # Optional NDJSON agent logs (similar to debug session). Writes to /app/logs/agent.log
+      - CAAL_AGENT_NDJSON_LOG=${CAAL_AGENT_NDJSON_LOG:-0}
+      - CAAL_AGENT_LOG_PATH=${CAAL_AGENT_LOG_PATH:-/app/logs/agent.log}
+      - CAAL_AGENT_LOG_RUN_ID=${CAAL_AGENT_LOG_RUN_ID:-run1}
     volumes:
       - ./caal-memory:/app/data
+      - ./caal-logs:/app/logs
       - ./caal-config:/app/config  # Runtime config (settings.json, mcp_servers.json)
       - ./prompt:/app/prompt  # Prompt files (custom.md is gitignored)
     networks:
@@ -106,7 +168,7 @@ services:
     environment:
       - LIVEKIT_URL=ws://livekit:7880
       - LIVEKIT_API_KEY=${LIVEKIT_API_KEY:-devkey}
-      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET:-secret}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET:-u_nnSY8qsRbA3AI1-HzRHCqM_eujNA2cEtr2Wl3JNMk}
       - NEXT_PUBLIC_LIVEKIT_URL=${HTTPS_DOMAIN:+wss://${HTTPS_DOMAIN}:7443}
       - WEBHOOK_URL=http://agent:8889
     networks:

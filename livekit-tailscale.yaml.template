@@ -1,7 +1,7 @@
 port: 7880
 log_level: info
 keys:
-  devkey: secret
+  devkey: u_nnSY8qsRbA3AI1-HzRHCqM_eujNA2cEtr2Wl3JNMk
 
 rtc:
   use_external_ip: false
@@ -10,6 +10,7 @@ rtc:
   port_range_end: 50100
 
 # TURN/TLS for remote access (Tailscale or mkcert)
+# Note: relay_address is automatically derived from --node-ip flag
 turn:
   enabled: true
   domain: ${HTTPS_DOMAIN}

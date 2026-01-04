@@ -22,13 +22,16 @@ import inspect
 import json
 import logging
 import time
+import asyncio
 from collections.abc import AsyncIterable
 from typing import Any
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from ..utils.formatting import strip_markdown_for_tts
 from ..integrations.n8n import execute_n8n_workflow
+from ..ndjson_log import enabled as ndjson_enabled
+from ..ndjson_log import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -121,13 +124,49 @@ async def llamacpp_llm_node(
     # Get base_url from agent's LLM instance
     base_url = getattr(agent.llm, "base_url", "http://llama.home/v1")
 
-    # Initialize OpenAI client for llama.cpp server
-    client = OpenAI(
+    # (debug instrumentation removed)
+
+    # Initialize Async OpenAI client for llama.cpp server
+    # IMPORTANT: this function is async; using the sync OpenAI client here can block the event loop
+    # and prevent TTS/audio playout from running.
+    client = AsyncOpenAI(
         base_url=base_url,
         api_key="not-needed",  # llama.cpp doesn't require auth
     )
 
+    async def _create_with_timeout(params: dict, *, purpose: str, timeout_s: float = 20.0):
+        """Call llama.cpp with explicit timeout."""
+        t0 = time.time()
+        log_event(
+            hypothesis_id="L",
+            location="llamacpp_node.py:_create_with_timeout",
+            message="LLM request start",
+            data={
+                "purpose": purpose,
+                "stream": bool(params.get("stream")),
+                "has_tools": "tools" in params,
+            },
+        )
+        try:
+            resp = await asyncio.wait_for(client.chat.completions.create(**params), timeout=timeout_s)
+            log_event(
+                hypothesis_id="L",
+                location="llamacpp_node.py:_create_with_timeout",
+                message="LLM request ok",
+                data={"purpose": purpose, "elapsed_ms": int((time.time() - t0) * 1000)},
+            )
+            return resp
+        except asyncio.TimeoutError:
+            log_event(
+                hypothesis_id="L",
+                location="llamacpp_node.py:_create_with_timeout",
+                message="LLM request timeout",
+                data={"purpose": purpose, "timeout_s": timeout_s},
+            )
+            raise
+
     try:
+        _t0 = time.time()
         # Build messages from chat context with sliding window
         messages = _build_messages_from_context(
             chat_ctx,
@@ -135,8 +174,59 @@ async def llamacpp_llm_node(
             max_turns=max_turns,
         )
 
+        # If chat_ctx contains consecutive user messages, the LLM may "continue" answering
+        # the earlier one (especially after tool calls) because the assistant reply may not
+        # be persisted into chat_ctx by the voice pipeline. We bridge this by inserting the
+        # last assistant reply (tracked on the agent) between the two user messages.
+        try:
+            last_assistant = getattr(agent, "_caal_last_assistant_reply", None)
+            if (
+                isinstance(last_assistant, str)
+                and last_assistant
+                and len(messages) >= 2
+                and messages[-1].get("role") == "user"
+                and messages[-2].get("role") == "user"
+            ):
+                messages.insert(len(messages) - 1, {"role": "assistant", "content": last_assistant})
+                log_event(
+                    hypothesis_id="CTX",
+                    location="llamacpp_node.py:llamacpp_llm_node",
+                    message="Inserted cached assistant reply between consecutive user messages",
+                    data={"assistant_preview": last_assistant[:200]},
+                )
+        except Exception:
+            pass
+
         # Discover tools from agent and MCP servers
         openai_tools = await _discover_tools(agent)
+        # (debug instrumentation removed)
+        log_event(
+            hypothesis_id="L",
+            location="llamacpp_node.py:llamacpp_llm_node",
+            message="LLM node entered",
+            data={"model": model, "messages_len": len(messages), "tools_len": len(openai_tools)},
+        )
+        # Snapshot what the LLM sees at the tail of context (useful for debugging "wrong answer" issues).
+        if ndjson_enabled():
+            try:
+                last_user = ""
+                last_roles = [m.get("role") for m in messages[-8:]]
+                for m in reversed(messages):
+                    if m.get("role") == "user":
+                        last_user = (m.get("content") or "")[:200]
+                        break
+                log_event(
+                    hypothesis_id="CTX",
+                    location="llamacpp_node.py:llamacpp_llm_node",
+                    message="Context snapshot",
+                    data={
+                        "last_roles": last_roles,
+                        "last_user_preview": last_user,
+                        "last_msg_role": (messages[-1].get("role") if messages else None),
+                    },
+                )
+            except Exception:
+                pass
 
         # Prepare API parameters
         api_params = {
@@ -152,7 +242,13 @@ async def llamacpp_llm_node(
             api_params["tools"] = openai_tools
             api_params["tool_choice"] = "auto"
 
-            response = client.chat.completions.create(**api_params)
+            try:
+                response = await _create_with_timeout(api_params, purpose="toolcheck", timeout_s=20.0)
+            except asyncio.TimeoutError:
+                # Fallback: retry without tools (prevents hanging forever on tool-enabled requests)
+                api_params.pop("tools", None)
+                api_params.pop("tool_choice", None)
+                response = await _create_with_timeout(api_params, purpose="toolcheck_fallback_no_tools", timeout_s=20.0)
 
             # Check for tool calls
             choice = response.choices[0] if response.choices else None
@@ -173,7 +269,6 @@ async def llamacpp_llm_node(
 
                 # Publish tool status immediately
                 if hasattr(agent, "_on_tool_status") and agent._on_tool_status:
-                    import asyncio
                     asyncio.create_task(agent._on_tool_status(True, tool_names, tool_params))
 
                 # Execute tools and get results (cache structured data)
@@ -182,26 +277,108 @@ async def llamacpp_llm_node(
                     tool_data_cache=tool_data_cache,
                 )
 
-                # Stream follow-up response with tool results
+                # Follow-up response after tool results.
+                #
+                # IMPORTANT: Some OpenAI-compatible servers don't reliably stream delta.content.
+                # If we stream and get no content, the assistant reply isn't persisted anywhere
+                # (chat_ctx may not capture assistant messages), which can cause the next user turn
+                # to look like consecutive user messages and the model "continues" the prior task.
+                # Use non-stream followup to reliably capture full assistant reply.
                 followup_params = {
                     "model": model,
                     "messages": messages,
                     "temperature": temperature,
                     "top_p": top_p,
-                    "stream": True,
+                    "stream": False,
                 }
-                followup = client.chat.completions.create(**followup_params)
+                _t0_follow = time.time()
+                follow_resp = await _create_with_timeout(followup_params, purpose="followup", timeout_s=20.0)
+                content = ""
+                raw_content = ""
+                finish_reason = None
+                has_tool_calls = False
+                role = None
+                try:
+                    ch0 = follow_resp.choices[0] if getattr(follow_resp, "choices", None) else None
+                    finish_reason = getattr(ch0, "finish_reason", None)
+                    msg0 = getattr(ch0, "message", None)
+                    role = getattr(msg0, "role", None)
+                    has_tool_calls = bool(getattr(msg0, "tool_calls", None))
+                    raw_content = getattr(msg0, "content", None) or ""
+                    content = raw_content.strip()
+                except Exception:
+                    content = ""
 
-                for chunk in followup:
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        yield strip_markdown_for_tts(chunk.choices[0].delta.content)
+                log_event(
+                    hypothesis_id="TH",
+                    location="llamacpp_node.py:llamacpp_llm_node",
+                    message="followup non-stream finished",
+                    data={
+                        "elapsed_ms": int((time.time() - _t0_follow) * 1000),
+                        "finish_reason": str(finish_reason)[:40] if finish_reason is not None else None,
+                        "role": str(role)[:24] if role is not None else None,
+                        "has_tool_calls": has_tool_calls,
+                        "raw_content_len": len(raw_content),
+                        "raw_content_preview": raw_content[:160],
+                        "content_preview": content[:160],
+                        "messages_len": len(messages),
+                        "tail_roles": [m.get("role") for m in messages[-5:]],
+                        "tail_tool_content_lens": [
+                            len(m.get("content") or "") for m in messages[-5:] if m.get("role") == "tool"
+                        ][:3],
+                    },
+                )
+                try:
+                    agent._caal_last_assistant_reply = content
+                except Exception:
+                    pass
+                if content:
+                    yield strip_markdown_for_tts(content)
+                    return
+
+                # Fallback: if the followup completion comes back empty (observed with some OpenAI-compatible servers),
+                # speak the last tool result directly so the user still gets an answer.
+                tool_fallback = ""
+                try:
+                    for m in reversed(messages):
+                        if m.get("role") == "tool":
+                            tool_fallback = (m.get("content") or "").strip()
+                            break
+                except Exception:
+                    tool_fallback = ""
+
+                log_event(
+                    hypothesis_id="TH",
+                    location="llamacpp_node.py:llamacpp_llm_node",
+                    message="followup empty: using tool fallback",
+                    data={
+                        "tool_fallback_len": len(tool_fallback),
+                        "tool_fallback_preview": tool_fallback[:160],
+                    },
+                )
+
+                if tool_fallback:
+                    # Keep it reasonably short for TTS.
+                    yield strip_markdown_for_tts(tool_fallback[:800])
+                else:
+                    yield "Okay."
                 return
 
             # No tool calls - return content directly
             elif choice and choice.message.content:
+                # Persist assistant reply for next turn (used to bridge missing assistant messages in chat_ctx)
+                try:
+                    agent._caal_last_assistant_reply = choice.message.content or ""
+                except Exception:
+                    pass
+                log_event(
+                    hypothesis_id="L",
+                    location="llamacpp_node.py:llamacpp_llm_node",
+                    message="Toolcheck returned direct content",
+                    data={"content_preview": (choice.message.content or "")[:160]},
+                )
                 # Publish no-tool status immediately
                 if hasattr(agent, "_on_tool_status") and agent._on_tool_status:
-                    import asyncio
                     asyncio.create_task(agent._on_tool_status(False, [], []))
                 yield strip_markdown_for_tts(choice.message.content)
                 return
@@ -209,7 +386,6 @@ async def llamacpp_llm_node(
         # No tools or no tool calls - stream directly
         # Publish no-tool status immediately
         if hasattr(agent, "_on_tool_status") and agent._on_tool_status:
-            import asyncio
             asyncio.create_task(agent._on_tool_status(False, [], []))
 
         stream_params = {
@@ -219,11 +395,42 @@ async def llamacpp_llm_node(
             "top_p": top_p,
             "stream": True,
         }
-        response_stream = client.chat.completions.create(**stream_params)
+        try:
+            response_stream = await _create_with_timeout(stream_params, purpose="main_stream", timeout_s=20.0)
+        except asyncio.TimeoutError:
+            # Fallback: retry without tools if the tools-enabled request times out for some reason
+            stream_params.pop("tools", None)
+            stream_params.pop("tool_choice", None)
+            response_stream = await _create_with_timeout(stream_params, purpose="main_stream_fallback_no_tools", timeout_s=20.0)
 
-        for chunk in response_stream:
+        _first = True
+        _t_stream0 = time.time()
+        _out_parts: list[str] = []
+        async for chunk in response_stream:
             if chunk.choices and chunk.choices[0].delta.content:
-                yield strip_markdown_for_tts(chunk.choices[0].delta.content)
+                if _first:
+                    _first = False
+                    log_event(
+                        hypothesis_id="TH",
+                        location="llamacpp_node.py:llamacpp_llm_node",
+                        message="main stream first chunk",
+                        data={},
+                    )
+                piece = strip_markdown_for_tts(chunk.choices[0].delta.content)
+                _out_parts.append(piece)
+                yield piece
+        log_event(
+            hypothesis_id="TH",
+            location="llamacpp_node.py:llamacpp_llm_node",
+            message="main stream finished",
+            data={"elapsed_ms": int((time.time() - _t_stream0) * 1000)},
+        )
+        # Persist assistant reply for next turn (used to bridge missing assistant messages in chat_ctx)
+        try:
+            agent._caal_last_assistant_reply = "".join(_out_parts)
+        except Exception:
+            pass
+        # (debug instrumentation removed)
 
     except Exception as e:
         logger.error(f"Error in llamacpp_llm_node: {e}", exc_info=True)
@@ -476,9 +683,22 @@ async def _execute_tool_calls(
         except (json.JSONDecodeError, TypeError):
             arguments = {}
         logger.info(f"Executing tool: {tool_name} with args: {arguments}")
+        _t0 = time.time()
+        log_event(
+            hypothesis_id="TH",
+            location="llamacpp_node.py:_execute_tool_calls",
+            message="tool start",
+            data={"tool": tool_name, "args_keys": list(arguments.keys())[:12]},
+        )
 
         try:
             tool_result = await _execute_single_tool(agent, tool_name, arguments)
+            log_event(
+                hypothesis_id="TH",
+                location="llamacpp_node.py:_execute_tool_calls",
+                message="tool ok",
+                data={"tool": tool_name, "elapsed_ms": int((time.time() - _t0) * 1000)},
+            )
 
             # Cache structured data if present
             if tool_data_cache and isinstance(tool_result, dict):
@@ -495,6 +715,12 @@ async def _execute_tool_calls(
         except Exception as e:
             error_msg = f"Error executing tool {tool_name}: {e}"
             logger.error(error_msg, exc_info=True)
+            log_event(
+                hypothesis_id="TH",
+                location="llamacpp_node.py:_execute_tool_calls",
+                message="tool exception",
+                data={"tool": tool_name, "elapsed_ms": int((time.time() - _t0) * 1000), "error": str(e)[:200]},
+            )
             messages.append({
                 "role": "tool",
                 "content": error_msg,

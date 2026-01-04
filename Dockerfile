@@ -28,12 +28,24 @@ FROM base AS deps
 
 WORKDIR /app
 
-# Copy files needed for dependency installation
+# Copy only dependency files first (for better layer caching)
+# This layer will be cached unless pyproject.toml or uv.lock changes
 COPY pyproject.toml uv.lock README.md ./
-COPY src/ ./src/
 
-# Create virtual environment and install dependencies (non-editable)
-RUN uv sync --frozen --no-dev --no-editable
+# Install dependencies using cache mount for faster rebuilds
+# Cache mount speeds up package downloads on subsequent builds by caching
+# downloaded wheels/packages in /root/.cache/uv
+# This step installs all dependencies but not the project itself (src/ not copied yet)
+# Note: We use --no-frozen here to ensure all packages from pyproject.toml are installed
+# even if they're not yet in the lock file (like wyoming)
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --no-dev --no-install-project
+
+# Copy source code and install the project
+# This is a separate layer so code changes only rebuild this step
+# The project installation is fast since dependencies are already installed
+COPY src/ ./src/
+RUN uv sync --no-dev
 
 # ============================================================================
 # Production image

@@ -13,9 +13,12 @@ Usage:
 import re
 import sys
 import json
-import urllib.request
-import urllib.error
+import requests
 from pathlib import Path
+import urllib3
+
+# Disable SSL warnings for self-signed certificates
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def load_config():
@@ -63,16 +66,24 @@ def replace_placeholders(content: str, config: dict) -> str:
     return re.sub(r"\{\{(\w+)\}\}", replacer, content)
 
 
-def http_request(url: str, headers: dict, method: str = "GET", data: bytes = None) -> tuple:
-    """Make HTTP request using urllib. Returns (status_code, response_body)."""
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+def http_request(url: str, headers: dict, method: str = "GET", data: bytes = None, json_data: dict = None) -> tuple:
+    """Make HTTP request using requests. Returns (status_code, response_body)."""
+    # Disable SSL verification for self-signed certificates
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status, resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8")
-    except urllib.error.URLError as e:
-        raise ConnectionError(f"Could not connect: {e.reason}")
+        if method == "GET":
+            resp = requests.get(url, headers=headers, timeout=10, verify=False)
+        elif method == "POST":
+            if json_data is not None:
+                resp = requests.post(url, headers=headers, json=json_data, timeout=10, verify=False)
+            else:
+                resp = requests.post(url, headers=headers, data=data, timeout=10, verify=False)
+        elif method == "PUT":
+            resp = requests.put(url, headers=headers, json=json_data, timeout=10, verify=False)
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+        return resp.status_code, resp.text
+    except requests.exceptions.RequestException as e:
+        raise ConnectionError(f"Could not connect: {e}")
 
 
 def create_workflow(n8n_api: str, headers: dict, workflow: dict, n8n_host: str) -> bool:
@@ -89,17 +100,45 @@ def create_workflow(n8n_api: str, headers: dict, workflow: dict, n8n_host: str) 
 
     # Create workflow
     post_headers = {**headers, "Content-Type": "application/json"}
-    data = json.dumps(workflow).encode("utf-8")
-    status, body = http_request(f"{n8n_api}/workflows", post_headers, "POST", data)
+    status, body = http_request(f"{n8n_api}/workflows", post_headers, "POST", json_data=workflow)
     if status not in (200, 201):
         print(f"  Error creating {name}: {body}")
         return False
 
     resp_data = json.loads(body)
-    workflow_id = resp_data["id"]
+    
+    # Extract workflow ID - handle different response formats
+    workflow_id = None
+    if isinstance(resp_data, dict):
+        # Case 1: Direct ID at top level (HTTPS response format)
+        if "id" in resp_data:
+            workflow_id = resp_data["id"]
+        # Case 2: ID in data array (first item)
+        elif "data" in resp_data and isinstance(resp_data["data"], list) and len(resp_data["data"]) > 0:
+            workflow_obj = resp_data["data"][0]
+            if isinstance(workflow_obj, dict) and "id" in workflow_obj:
+                workflow_id = workflow_obj["id"]
+        # Case 3: ID in data object (if data is a dict)
+        elif "data" in resp_data and isinstance(resp_data["data"], dict) and "id" in resp_data["data"]:
+            workflow_id = resp_data["data"]["id"]
+    
+    if workflow_id is None:
+        # Fallback: Try to fetch the workflow by name (in case creation succeeded but response format is different)
+        status, body = http_request(f"{n8n_api}/workflows", headers)
+        if status == 200:
+            workflows = json.loads(body).get("data", [])
+            for wf in workflows:
+                if wf.get("name") == name and not wf.get("isArchived", False):
+                    workflow_id = wf.get("id")
+                    break
+        
+        if workflow_id is None:
+            print(f"  Error creating {name}: Unexpected response format - no workflow ID found")
+            print(f"           Response: {body}")
+            return False
 
     # Activate workflow
-    status, body = http_request(f"{n8n_api}/workflows/{workflow_id}/activate", post_headers, "POST")
+    status, body = http_request(f"{n8n_api}/workflows/{workflow_id}/activate", post_headers, "POST", json_data={})
     if status != 200:
         print(f"  Warning: Created {name} but could not activate")
         return True
@@ -145,7 +184,7 @@ def main():
     config = load_config()
     n8n_host = config["N8N_HOST"]
     api_key = config["N8N_API_KEY"]
-    n8n_api = f"http://{n8n_host}/api/v1"
+    n8n_api = f"https://{n8n_host}/api/v1"
     headers = {"X-N8N-API-KEY": api_key}
 
     # Process seed file with config values

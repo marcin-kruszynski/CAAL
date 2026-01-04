@@ -30,14 +30,41 @@ export function useInputControls({
 }: UseInputControlsProps = {}): UseInputControlsReturn {
   const { microphoneTrack, localParticipant } = useLocalParticipant();
 
+  const {
+    saveAudioInputEnabled,
+    saveVideoInputEnabled,
+    saveAudioInputDeviceId,
+    saveVideoInputDeviceId,
+  } = usePersistentUserChoices({ preventSave: !saveUserChoices });
+
   const microphoneToggle = useTrackToggle({
     source: Track.Source.Microphone,
-    onDeviceError: (error) => onDeviceError?.({ source: Track.Source.Microphone, error }),
+    onDeviceError: (error) => {
+      // Handle NotFoundError: device not found (e.g., device disconnected)
+      if (error instanceof DOMException && error.name === 'NotFoundError') {
+        console.warn(
+          '[useInputControls] Microphone device not found in onDeviceError, resetting to default device'
+        );
+        // Clear saved deviceId to force use of default device
+        saveAudioInputDeviceId('default');
+      }
+      onDeviceError?.({ source: Track.Source.Microphone, error });
+    },
   });
 
   const cameraToggle = useTrackToggle({
     source: Track.Source.Camera,
-    onDeviceError: (error) => onDeviceError?.({ source: Track.Source.Camera, error }),
+    onDeviceError: (error) => {
+      // Handle NotFoundError: device not found (e.g., device disconnected)
+      if (error instanceof DOMException && error.name === 'NotFoundError') {
+        console.warn(
+          '[useInputControls] Camera device not found in onDeviceError, resetting to default device'
+        );
+        // Clear saved deviceId to force use of default device
+        saveVideoInputDeviceId('default');
+      }
+      onDeviceError?.({ source: Track.Source.Camera, error });
+    },
   });
 
   const screenShareToggle = useTrackToggle({
@@ -52,13 +79,6 @@ export function useInputControls({
       publication: microphoneTrack,
     };
   }, [localParticipant, microphoneTrack]);
-
-  const {
-    saveAudioInputEnabled,
-    saveVideoInputEnabled,
-    saveAudioInputDeviceId,
-    saveVideoInputDeviceId,
-  } = usePersistentUserChoices({ preventSave: !saveUserChoices });
 
   const handleAudioDeviceChange = useCallback(
     (deviceId: string) => {
@@ -76,23 +96,71 @@ export function useInputControls({
 
   const handleToggleCamera = useCallback(
     async (enabled?: boolean) => {
-      if (screenShareToggle.enabled) {
-        screenShareToggle.toggle(false);
+      try {
+        if (screenShareToggle.enabled) {
+          screenShareToggle.toggle(false);
+        }
+        await cameraToggle.toggle(enabled);
+        // persist video input enabled preference
+        saveVideoInputEnabled(!cameraToggle.enabled);
+      } catch (error) {
+        // Handle NotFoundError: device not found (e.g., device disconnected)
+        if (error instanceof DOMException && error.name === 'NotFoundError') {
+          console.warn('[useInputControls] Camera device not found, resetting to default device');
+          // Clear saved deviceId and retry with default device
+          saveVideoInputDeviceId('default');
+          try {
+            // Retry with default device
+            await cameraToggle.toggle(enabled);
+            saveVideoInputEnabled(!cameraToggle.enabled);
+          } catch (retryError) {
+            console.error(
+              '[useInputControls] Failed to toggle camera even with default device:',
+              retryError
+            );
+            onDeviceError?.({ source: Track.Source.Camera, error: retryError as Error });
+          }
+        } else {
+          console.error('[useInputControls] Failed to toggle camera:', error);
+          onDeviceError?.({ source: Track.Source.Camera, error: error as Error });
+        }
       }
-      await cameraToggle.toggle(enabled);
-      // persist video input enabled preference
-      saveVideoInputEnabled(!cameraToggle.enabled);
     },
-    [cameraToggle, screenShareToggle, saveVideoInputEnabled]
+    [cameraToggle, screenShareToggle, saveVideoInputEnabled, saveVideoInputDeviceId, onDeviceError]
   );
 
   const handleToggleMicrophone = useCallback(
     async (enabled?: boolean) => {
-      await microphoneToggle.toggle(enabled);
-      // persist audio input enabled preference
-      saveAudioInputEnabled(!microphoneToggle.enabled);
+      try {
+        await microphoneToggle.toggle(enabled);
+        // persist audio input enabled preference
+        saveAudioInputEnabled(!microphoneToggle.enabled);
+      } catch (error) {
+        // Handle NotFoundError: device not found (e.g., device disconnected)
+        if (error instanceof DOMException && error.name === 'NotFoundError') {
+          console.warn(
+            '[useInputControls] Microphone device not found, resetting to default device'
+          );
+          // Clear saved deviceId and retry with default device
+          saveAudioInputDeviceId('default');
+          try {
+            // Retry with default device
+            await microphoneToggle.toggle(enabled);
+            saveAudioInputEnabled(!microphoneToggle.enabled);
+          } catch (retryError) {
+            console.error(
+              '[useInputControls] Failed to toggle microphone even with default device:',
+              retryError
+            );
+            onDeviceError?.({ source: Track.Source.Microphone, error: retryError as Error });
+          }
+        } else {
+          console.error('[useInputControls] Failed to toggle microphone:', error);
+          onDeviceError?.({ source: Track.Source.Microphone, error: error as Error });
+        }
+      }
     },
-    [microphoneToggle, saveAudioInputEnabled]
+    [microphoneToggle, saveAudioInputEnabled, saveAudioInputDeviceId, onDeviceError]
   );
 
   const handleToggleScreenShare = useCallback(
